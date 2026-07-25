@@ -244,11 +244,6 @@ sudo ./ghostbuster -ports "8080" -dry-run -v
 
 ---
 
-## 📄 License
-
-MIT License — see [LICENSE](LICENSE) for details.
-
----
 
 ## 🙏 Acknowledgments
 
