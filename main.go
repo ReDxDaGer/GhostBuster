@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -18,7 +19,6 @@ import (
 	"time"
 )
 
-// ProcessState defines the health status of a discovered port
 type ProcessState string
 
 const (
@@ -29,17 +29,14 @@ const (
 	StateUnknown   ProcessState = "UNKNOWN"
 )
 
-// TargetPort represents a monitored port and its associated state
 type TargetPort struct {
 	Port        int
 	PID         int
 	State       ProcessState
 	Latency     time.Duration
-	LastActive  time.Time
 	ProcessName string
 }
 
-// DaemonConfig holds safety guidelines and thresholds
 type DaemonConfig struct {
 	ProtectedPorts []int
 	ProbeTimeout   time.Duration
@@ -51,14 +48,12 @@ type DaemonConfig struct {
 
 type GhostBuster struct {
 	config DaemonConfig
-	mu     sync.Mutex
 }
 
 func NewGhostBuster(cfg DaemonConfig) *GhostBuster {
 	return &GhostBuster{config: cfg}
 }
 
-// IsProtected checks if a port is on the whitelist
 func (gb *GhostBuster) IsProtected(port int) bool {
 	for _, p := range gb.config.ProtectedPorts {
 		if p == port {
@@ -68,13 +63,18 @@ func (gb *GhostBuster) IsProtected(port int) bool {
 	return false
 }
 
-// resolvePortToPID finds the process ID listening on a given port (Linux only)
 func resolvePortToPID(port int) (int, string, error) {
-	if runtime.GOOS != "linux" {
-		return -1, "", fmt.Errorf("PID resolution only supported on Linux")
+	switch runtime.GOOS {
+	case "linux":
+		return resolvePortToPIDLinux(port)
+	case "darwin":
+		return resolvePortToPIDDarwin(port)
+	default:
+		return -1, "", fmt.Errorf("unsupported platform: %s", runtime.GOOS)
 	}
+}
 
-	// Read /proc/net/tcp to find inode for the port
+func resolvePortToPIDLinux(port int) (int, string, error) {
 	inode, err := findInodeByPort(port)
 	if err != nil {
 		return -1, "", err
@@ -83,13 +83,36 @@ func resolvePortToPID(port int) (int, string, error) {
 		return -1, "", fmt.Errorf("no process found listening on port %d", port)
 	}
 
-	// Search /proc/*/fd/ for matching inode
 	pid, name, err := findPIDByInode(inode)
 	if err != nil {
 		return -1, "", err
 	}
 
 	return pid, name, nil
+}
+
+func resolvePortToPIDDarwin(port int) (int, string, error) {
+	out, err := exec.Command("lsof", "-nP", fmt.Sprintf("-iTCP:%d", port), "-sTCP:LISTEN").Output()
+	if err != nil {
+		return -1, "", fmt.Errorf("no process found listening on port %d", port)
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(lines) < 2 {
+		return -1, "", fmt.Errorf("no process found listening on port %d", port)
+	}
+
+	fields := strings.Fields(lines[1])
+	if len(fields) < 2 {
+		return -1, "", fmt.Errorf("unexpected lsof output for port %d", port)
+	}
+
+	pid, err := strconv.Atoi(fields[1])
+	if err != nil {
+		return -1, "", err
+	}
+
+	return pid, fields[0], nil
 }
 
 func findInodeByPort(port int) (string, error) {
@@ -102,9 +125,7 @@ func findInodeByPort(port int) (string, error) {
 	targetPortHex := fmt.Sprintf("%04X", port)
 	scanner := bufio.NewScanner(file)
 
-	// Skip header
 	if scanner.Scan() {
-		// header line
 	}
 
 	for scanner.Scan() {
@@ -113,7 +134,6 @@ func findInodeByPort(port int) (string, error) {
 			continue
 		}
 
-		// Local address is field 1, format: 0100007F:1F90 (hex IP:port)
 		localAddr := fields[1]
 		parts := strings.Split(localAddr, ":")
 		if len(parts) != 2 {
@@ -121,7 +141,7 @@ func findInodeByPort(port int) (string, error) {
 		}
 
 		if parts[1] == targetPortHex {
-			return fields[9], nil // inode is the 10th field
+			return fields[9], nil
 		}
 	}
 
@@ -145,7 +165,7 @@ func findPIDByInode(inode string) (int, string, error) {
 
 		pid, err := strconv.Atoi(entry.Name())
 		if err != nil {
-			continue // not a PID directory
+			continue
 		}
 
 		fdDir := filepath.Join("/proc", entry.Name(), "fd")
@@ -160,7 +180,6 @@ func findPIDByInode(inode string) (int, string, error) {
 				continue
 			}
 			if link == "socket:["+inode+"]" {
-				// Get process name
 				commBytes, _ := os.ReadFile(filepath.Join("/proc", entry.Name(), "comm"))
 				name := strings.TrimSpace(string(commBytes))
 				return pid, name, nil
@@ -171,11 +190,23 @@ func findPIDByInode(inode string) (int, string, error) {
 	return -1, "", fmt.Errorf("inode %s not found in any process", inode)
 }
 
-// ProbeHealth tests if a service running on a port is genuinely responsive
+func isCriticalProcess(name string) bool {
+	critical := map[string]bool{
+		"systemd":      true,
+		"launchd":      true,
+		"kernel_task":  true,
+		"windowserver": true,
+		"sshd":         true,
+		"init":         true,
+		"xorg":         true,
+		"loginwindow":  true,
+	}
+	return critical[strings.ToLower(name)]
+}
+
 func (gb *GhostBuster) ProbeHealth(port int) TargetPort {
 	target := TargetPort{
-		Port:       port,
-		LastActive: time.Now(),
+		Port: port,
 	}
 
 	if gb.IsProtected(port) {
@@ -183,10 +214,8 @@ func (gb *GhostBuster) ProbeHealth(port int) TargetPort {
 		return target
 	}
 
-	// Resolve PID first
 	pid, name, err := resolvePortToPID(port)
 	if err != nil {
-		// Port not owned by any process
 		target.State = StateClosed
 		if gb.config.Verbose {
 			fmt.Printf("  [debug] Port %d: %v\n", port, err)
@@ -200,17 +229,14 @@ func (gb *GhostBuster) ProbeHealth(port int) TargetPort {
 	address := fmt.Sprintf("127.0.0.1:%d", port)
 	start := time.Now()
 
-	// Stage 1: Basic TCP Dial with tight timeout
 	conn, err := net.DialTimeout("tcp", address, gb.config.ProbeTimeout)
 	if err != nil {
-		// Process owns port but not listening? Weird state.
 		target.State = StateHung
 		return target
 	}
 	target.Latency = time.Since(start)
 	conn.Close()
 
-	// Stage 2: Deep Health Probe (HTTP GET request)
 	ctx, cancel := context.WithTimeout(context.Background(), gb.config.ProbeTimeout)
 	defer cancel()
 
@@ -219,7 +245,6 @@ func (gb *GhostBuster) ProbeHealth(port int) TargetPort {
 
 	resp, err := client.Do(req)
 	if err != nil {
-		// TCP handshake succeeded, but HTTP layer failed/hung! Potential zombie/hung process.
 		target.State = StateHung
 		return target
 	}
@@ -229,20 +254,31 @@ func (gb *GhostBuster) ProbeHealth(port int) TargetPort {
 	return target
 }
 
-// ReapProcess performs graceful process termination (SIGTERM -> SIGKILL)
 func (gb *GhostBuster) ReapProcess(target TargetPort) error {
-	if target.PID <= 0 {
-		return fmt.Errorf("invalid PID %d", target.PID)
+	if target.PID <= 1 {
+		return fmt.Errorf("refusing to kill PID %d", target.PID)
+	}
+
+	if target.State != StateHung {
+		return fmt.Errorf("refusing to kill non-hung target on port %d", target.Port)
+	}
+
+	if gb.IsProtected(target.Port) {
+		return fmt.Errorf("refusing to kill protected port %d", target.Port)
+	}
+
+	if isCriticalProcess(target.ProcessName) {
+		return fmt.Errorf("refusing to kill critical process %s (PID %d)", target.ProcessName, target.PID)
+	}
+
+	currentPID, _, err := resolvePortToPID(target.Port)
+	if err != nil || currentPID != target.PID {
+		return fmt.Errorf("port %d no longer owned by PID %d, aborting kill", target.Port, target.PID)
 	}
 
 	proc, err := os.FindProcess(target.PID)
 	if err != nil {
 		return fmt.Errorf("failed to locate PID %d: %v", target.PID, err)
-	}
-
-	// Safety: double-check we're not killing init or kernel threads
-	if target.PID <= 1 {
-		return fmt.Errorf("refusing to kill system process PID %d", target.PID)
 	}
 
 	if gb.config.DryRun {
@@ -254,21 +290,16 @@ func (gb *GhostBuster) ReapProcess(target TargetPort) error {
 	fmt.Printf("  ⚠️  Sending SIGTERM to PID %d (%s) [port %d]...\n",
 		target.PID, target.ProcessName, target.Port)
 
-	// 1. Attempt Graceful Shutdown via SIGTERM
 	err = proc.Signal(syscall.SIGTERM)
 	if err != nil {
 		return fmt.Errorf("SIGTERM failed: %v", err)
 	}
 
-	// 2. Wait for Grace Period
 	time.Sleep(gb.config.GracePeriod)
 
-	// 3. Check if process is still alive. If yes, escalate to SIGKILL
 	if err := proc.Signal(syscall.Signal(0)); err == nil {
 		fmt.Printf("  🚨 PID %d ignored SIGTERM. Escalating to SIGKILL!\n", target.PID)
-		if !gb.config.DryRun {
-			_ = proc.Signal(syscall.SIGKILL)
-		}
+		_ = proc.Signal(syscall.SIGKILL)
 	}
 
 	fmt.Printf("  ✅ Reclaimed port %d from PID %d (%s)\n",
@@ -276,7 +307,6 @@ func (gb *GhostBuster) ReapProcess(target TargetPort) error {
 	return nil
 }
 
-// ConcurrentScan scans a range of ports using a Goroutine Worker Pool
 func (gb *GhostBuster) ConcurrentScan(ports []int) []TargetPort {
 	results := make([]TargetPort, 0, len(ports))
 	resultsChan := make(chan TargetPort, len(ports))
@@ -289,7 +319,6 @@ func (gb *GhostBuster) ConcurrentScan(ports []int) []TargetPort {
 
 	var wg sync.WaitGroup
 
-	// Spawn Workers
 	for i := 0; i < numWorkers; i++ {
 		wg.Add(1)
 		go func() {
@@ -300,7 +329,6 @@ func (gb *GhostBuster) ConcurrentScan(ports []int) []TargetPort {
 		}()
 	}
 
-	// Send ports to scan
 	for _, p := range ports {
 		portsChan <- p
 	}
@@ -313,7 +341,6 @@ func (gb *GhostBuster) ConcurrentScan(ports []int) []TargetPort {
 		results = append(results, res)
 	}
 
-	// Sort by port number for consistent output
 	sort.Slice(results, func(i, j int) bool {
 		return results[i].Port < results[j].Port
 	})
@@ -331,7 +358,6 @@ func parsePortList(input string) ([]int, error) {
 			continue
 		}
 
-		// Check for range: 8000-8010
 		if strings.Contains(part, "-") {
 			rangeParts := strings.Split(part, "-")
 			if len(rangeParts) != 2 {
@@ -376,19 +402,24 @@ func main() {
 	)
 	flag.Parse()
 
-	if runtime.GOOS != "linux" {
-		fmt.Fprintf(os.Stderr, "❌ This tool requires Linux (uses /proc/net/tcp for PID resolution)\n")
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		fmt.Fprintf(os.Stderr, "❌ This tool requires Linux or macOS\n")
 		os.Exit(1)
 	}
 
-	// Parse protected ports
+	if runtime.GOOS == "darwin" {
+		if _, err := exec.LookPath("lsof"); err != nil {
+			fmt.Fprintf(os.Stderr, "❌ lsof is required on macOS but was not found in PATH\n")
+			os.Exit(1)
+		}
+	}
+
 	protectedPorts, err := parsePortList(*protected)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Invalid protected ports: %v\n", err)
 		os.Exit(1)
 	}
 
-	// Parse target ports
 	portsToScan, err := parsePortList(*portList)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Invalid port list: %v\n", err)
@@ -431,12 +462,10 @@ func main() {
 	fmt.Printf("  ⏱️  Probe timeout: %v | Grace period: %v\n", config.ProbeTimeout, config.GracePeriod)
 	fmt.Println()
 
-	// Run scan
 	startTime := time.Now()
 	results := daemon.ConcurrentScan(portsToScan)
 	scanDuration := time.Since(startTime)
 
-	// Display results
 	fmt.Printf("  ⏱️  Scan completed in %v\n\n", scanDuration)
 
 	var zombies []TargetPort
@@ -465,7 +494,6 @@ func main() {
 
 	fmt.Println()
 
-	// Summary
 	fmt.Printf("  📊 Results: %d healthy, %d free, %d protected, %d zombie(s)\n",
 		healthy, closed, protectedCount, len(zombies))
 
@@ -474,7 +502,6 @@ func main() {
 		return
 	}
 
-	// Handle zombies
 	fmt.Printf("\n  ⚠️  Found %d zombie/hung process(es)\n", len(zombies))
 
 	if !*killZombies && !config.DryRun {
@@ -484,7 +511,6 @@ func main() {
 		return
 	}
 
-	// Confirmation unless -force or -dry-run
 	if !config.Force && !config.DryRun {
 		fmt.Print("\n  ⚡ Proceed with termination? [y/N]: ")
 		reader := bufio.NewReader(os.Stdin)
@@ -496,7 +522,6 @@ func main() {
 		}
 	}
 
-	// Kill zombies
 	fmt.Println()
 	fmt.Println("  🔥 Reaping zombies...")
 	fmt.Println()
